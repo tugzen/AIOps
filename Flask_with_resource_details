@@ -1,0 +1,304 @@
+from flask import Flask, request, render_template, jsonify,abort,flash,redirect,url_for,session
+import requests
+import json
+import os
+import base64
+from openai import AzureOpenAI
+import subprocess
+import re
+#import regex as re
+import time
+from datetime import datetime, timedelta, timezone
+
+
+
+class AIOps:
+    def __init__(self, name):
+        self.app = Flask(name)
+        self.app.secret_key = 'CGI_secret_key'
+        self.configure_routes()
+        self.PID=None
+        self.run_id=None
+        self.AI_output=None
+        self.azure_data=None
+        self.activity_log=None
+        self.az_command=None
+        self.policy_definitions=None
+        self.resource_group='Showcase-Project-Dev'
+
+    def configure_routes(self):
+        @self.app.route('/', methods=['GET', 'POST'])
+        def index():
+            if request.method == 'POST':
+                user_input = request.form['user_input']
+                # Process the input here
+                AIOps.az_data(self)
+                #print (self.azure_data)
+
+                run_id = self.azure_ai_conn(user_input)
+                #PID = return_PID(self.PID)
+                print (f"PID is : {self.PID}")
+                
+                if not run_id:
+                    print ('there is no run_id')
+                    #self.AI_output = "Sorry, I couldn't understand. Can you repeat again?"
+                    flash(self.AI_output)
+                    return redirect(url_for('index'))
+                
+                return render_template('index.html', run_id=run_id)
+            return render_template('index.html', result=self.AI_output)
+        
+        @self.app.route('/status/<run_id>', methods=['GET'])    
+        def check_pipeline_status(run_id=None):
+            return jsonify(AIOps.get_pipeline_status(self,self.PID,run_id))
+        
+    def az_data(self):
+     
+        try:
+            azure_data=subprocess.run(["az", "resource", "list", "--output", "table"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True)
+            print ('resource list is fetched')
+            self.azure_data=azure_data
+            activity_log=subprocess.run(["az","monitor","activity-log","list","--output","table"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True)
+            self.activity_log=activity_log
+            print ('activity logs are fetched')
+#            policy_definitions=subprocess.run(["az","policy","definition","list","--output","table"],
+#                stdout=subprocess.PIPE,
+#                stderr=subprocess.PIPE,
+#                text=True)    
+#            self.policy_definitions=policy_definitions
+            #print (f'policy_definitions are :{self.policy_definitions}')
+        except:
+            print ("Error", azure_data.stderr) 
+           
+
+
+    def azure_ai_conn(self, user_input):
+
+        client = AzureOpenAI(
+        api_key = os.getenv("AZURE_OPENAI_API_KEY"),  
+        api_version = "2024-02-01",
+        azure_endpoint = os.getenv("AZURE_OPENAI_ENDPOINT")
+        )
+        
+        input=user_input
+        print (f"input is:{input}")
+        
+
+        
+
+        response = client.chat.completions.create(
+            #model="gpt-4o", # model = "deployment_name".
+            model="AIOps-Showcase",
+            messages=[
+                {"role": "system", "content": f" You are an Assistant trained by OpenAI.You will be asked to deploy some resource for  to Azure environment. We have different pipelines in Azure Devops for every resource the customer ask. For example we have seperate pipeline for deploying an Ubuntu machine  and another one for other resources. Basically we need to trigger the releated pipeline according to customer request, and to do this we need only a pipeline id, which is different for every resources.What I need from you, you need give the releated Pipeline ID as response. Take into consideration: 1. If the customer asks something like 'deploy an Ubuntu machine with pipeline' or 'deploy a virtual machine with pipeline', turn 'Pipeline ID=129 as answer'. 2. If the customer asks something like 'deploy a docker/container with pipeline'' , turn 'Pipeline ID=128' as answer 3. If the customer asks something like 'deploy a web server with pipeline'', turn 'Pipeline ID=130' as answer. The customer data resources are '{self.azure_data}'Also the activity logs are '{self.activity_log}'. If the customer asks something specific about his azure environment, you can answer it accordign the this data. If someone asks you to give az cli command , always use ```bash ....` format.  If someone asks you to restart/stop/start/delete/create/deploy/check/list something with 'az cli command' , always use ```sh ....` format. "
+    },
+                {"role": "user", "content": f"{input}"
+        }
+            ]
+        )
+        
+        response_text= response.choices[0].message.content
+        self.AI_output=response_text
+        print (f'AI response is:{response_text}') 
+        print (f'AI output is : {self.AI_output}')
+
+        
+        try:
+            pattern=r"\`\`\`sh\s(az.*)\s\`\`\`"
+            az_cli_command=re.findall(pattern,response_text,re.DOTALL)
+            self.az_command=az_cli_command[0]
+            
+            print (self.az_command)
+            self.AI_output=f'{self.az_command} is applied.'
+            AIOps.az_command_apply(self,self.az_command)
+            return None
+        
+        except Exception as err:
+            print (err)
+            pass
+
+
+        #regex
+        pattern = r"=(.*)"
+        PID = re.findall(pattern, response_text, re.DOTALL)
+        print (f'first PID is : {PID}')
+        try: 
+            PID=PID[0]
+            self.PID=PID
+            print (f'PID is :{PID}')
+            #trigger=AIOps.trigger_pipeline(self,PID)
+            #return trigger
+            #trigger pipeline
+            
+
+        except Exception as err:
+            #print ('PID is not correct. Can you exapin again?')
+            #abort(400)
+            #return AIOps.configure_routes(index)
+            return None
+        else:
+            trigger=AIOps.trigger_pipeline(self,PID)
+            return trigger
+
+    def az_command_apply(self,az_command):
+        command=self.az_command
+        print (f'The command is {command}')
+        #subprocess.run(command, shell=True, check=True)
+        result = subprocess.run(command, shell=True, check=True, capture_output=True, text=True)
+        print("Command output:", result.stdout)
+        if result.stdout:
+            self.AI_output=result.stdout
+        else:
+            self.AI_output=f'{self.az_command} is applied. There is no output for the applied command.'
+
+    def return_PID(self,PID):
+        return PID
+
+    def trigger_pipeline(self,PID):
+    
+        #print (f"inside trigger function, PID is: {PID}")
+        os.environ["AzureDevOpsOrg"] = "cndpv2"
+        os.environ["AzureDevOpsProject"] = "CCT%20Showcase"
+        os.environ["AzureDevOpsPipelineID"] = f"{PID}"
+        os.environ["AzureDevOpsPAT"] = "r73e3ogfmsvyohcmygljpvnx7ptkgv3t43ldq7ztxbtla255cprq"
+
+        azure_devops_org = os.getenv("AzureDevOpsOrg")
+        azure_devops_project = os.getenv("AzureDevOpsProject")
+        azure_devops_pipeline_id = os.getenv("AzureDevOpsPipelineID")
+        azure_devops_pat = os.getenv("AzureDevOpsPAT")
+        encoded_pat = base64.b64encode(f":{azure_devops_pat}".encode()).decode()
+
+
+        try:
+            azure_devops_url = f"https://dev.azure.com/{azure_devops_org}/{azure_devops_project}/_apis/pipelines/{azure_devops_pipeline_id}/runs?api-version=6.0"
+            headers = {
+                "Content-Type": "application/json",
+                "Authorization": f"Basic {encoded_pat}"
+            }
+            data = {
+                "resources": {
+                    "repositories": {
+                        "self": {
+                            "refName": "refs/heads/CCT-Showcase-Preview"
+                        }
+                    }
+                }
+            }
+            response = requests.post(azure_devops_url, headers=headers, json=data)
+            response.raise_for_status()
+            
+            print("Response status code:", response.status_code)
+            print("Response content:", response.content)
+            
+  
+            #extract pipeline run id
+            run_id = response.json()['id']
+            print (f"run is is : {run_id}")
+            return run_id
+
+            #return response.json()
+            #status=AIOps.get_pipeline_status(self,PID,run_id)
+            #return status
+
+        except requests.exceptions.HTTPError as e:
+            print(f"HTTP Error: {e}")
+            print(f"Response content: {e.response.content}")
+            return {"error": str(e)}
+        except Exception as e:
+            print(f"Error in trigger_pipeline: {e}")
+            return {"error": str(e)}
+
+    
+    def get_pipeline_status(self,PID,run_id):
+        os.environ["AzureDevOpsOrg"] = "cndpv2"
+        os.environ["AzureDevOpsProject"] = "CCT%20Showcase"
+        os.environ["AzureDevOpsPipelineID"] = f"{PID}"
+        os.environ["AzureDevOpsPAT"] = "r73e3ogfmsvyohcmygljpvnx7ptkgv3t43ldq7ztxbtla255cprq"
+
+        azure_devops_org = os.getenv("AzureDevOpsOrg")
+        azure_devops_project = os.getenv("AzureDevOpsProject")
+        azure_devops_pipeline_id = os.getenv("AzureDevOpsPipelineID")
+        azure_devops_pat = os.getenv("AzureDevOpsPAT")
+        encoded_pat = base64.b64encode(f":{azure_devops_pat}".encode()).decode()
+
+
+
+
+        print (f"run_id is: {run_id}")
+        url = f'https://dev.azure.com/{azure_devops_org}/{azure_devops_project}/_apis/pipelines/{azure_devops_pipeline_id}/runs/{run_id}?api-version=6.0'
+                
+        headers = {
+                    'Content-Type': 'application/json',
+                    'Authorization': f'Basic {encoded_pat}'
+                }
+                
+        response = requests.get(url, headers=headers)
+        response.raise_for_status()
+                
+        state = response.json()['state']
+        result = response.json().get('result')
+        if response.status_code == 200:
+            data = response.json()
+            #print (f'pipeline_data is: {response.json()}')
+            new_resources=AIOps.get_new_resources(self.resource_group)
+            new_resources="\n".join(new_resources)
+            print(f'new resources are:{new_resources}')
+            return {
+                'state': data['state'],
+                'result': data.get('result'),
+                'new_resources':new_resources,
+                'azure_portal_link': f"https://portal.azure.com/#@cgicndp.onmicrosoft.com/resource/subscriptions/4139e5d0-b93c-4c6f-8296-cf894ad95dfd/resourceGroups/Showcase-Project-Dev/overview"
+            }
+        
+        return {'state': state, 'result': result}   
+                        
+          
+    def get_new_resources(resource_group):
+    # Execute the az cli command to get the list of resources
+        command = f"az resource list --resource-group {resource_group} --query '[].{{name:name, createdTime:createdTime}}'"
+        result = subprocess.run(command, shell=True, capture_output=True, text=True)
+
+        if result.returncode != 0:
+            print("Error executing the command")
+            print(result.stderr)
+            return []
+
+        resources = json.loads(result.stdout)
+
+        # Get the current time and subtract 1 minute to set the threshold
+        current_time = datetime.now(timezone.utc)
+        time_threshold = current_time - timedelta(minutes=5)
+
+        new_resources = []
+
+        for resource in resources:
+            # Parse the createdTime as a timezone-aware datetime
+            created_time = datetime.fromisoformat(resource['createdTime'])
+            if created_time > time_threshold:
+                new_resources.append(resource['name'])
+
+        return new_resources
+
+        # Example usage
+#        resource_group = 'Showcase-Project-Dev'
+#        new_resources = get_new_resources(resource_group)
+#        new_resources="\n".join(new_resources)
+#        print("Newly created resources in the last 1 minute:", new_resources)
+
+
+
+
+
+
+    def run(self, host='127.0.0.1', port=5001):
+        self.app.run(host=host, port=port, debug=True)
+
+if __name__ == '__main__':
+    app_instance = AIOps(__name__)
+    app_instance.run()
